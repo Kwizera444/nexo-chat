@@ -63,6 +63,10 @@ input, textarea { color: var(--ink); }
 .auth-submit { width: 100%; min-height: 48px; margin-top: 3px; }
 .legal-note { display: flex; align-items: flex-start; gap: 8px; color: #8e9891; font-size: 10px; line-height: 1.6; margin: 18px 0 0; }
 .legal-note svg { flex: 0 0 auto; color: var(--green); }
+.auth-form .sms-consent { display: flex; align-items: flex-start; gap: 8px; color: #828d85; font-size: 10px; font-weight: 500; line-height: 1.5; }
+.auth-form .sms-consent input[type='checkbox'] { width: 14px; height: 14px; flex: 0 0 auto; margin: 1px 0 0; padding: 0; accent-color: var(--accent); }
+.profile-edit-fields .sms-consent { display: flex; align-items: flex-start; gap: 8px; color: #828d85; font-size: 10px; font-weight: 500; line-height: 1.5; }
+.profile-edit-fields .sms-consent input[type='checkbox'] { width: 14px; height: 14px; flex: 0 0 auto; margin: 1px 0 0; padding: 0; accent-color: var(--accent); }
 .demo-link { margin-top: 22px; padding: 0; color: var(--green); }
 .form-error { padding: 10px 12px; border-left: 2px solid #c34c42; background: #fcf0ee; color: #a6463c; font-size: 12px; line-height: 1.5; }
 .otp-input { letter-spacing: 8px; font: 700 21px var(--font-display) !important; text-align: center; }

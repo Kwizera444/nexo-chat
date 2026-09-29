@@ -37,8 +37,8 @@ const getAiSettings = () => {
     : { provider: 'openai', apiKey: process.env.OPENAI_API_KEY, endpoint: process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1', model: process.env.OPENAI_MODEL || 'gpt-4o-mini' };
 };
 
-const safeUser = (user) => ({ id: user.id, name: user.name, email: user.email, handle: user.handle, avatar: user.avatar || '', cover: user.cover || '', bio: user.bio || '', verified: user.verified, createdAt: user.createdAt });
-const publicUser = (user) => { const { email: _email, ...profile } = safeUser(user); return profile; };
+const safeUser = (user) => ({ id: user.id, name: user.name, email: user.email, phone: user.phone || '', smsConsent: Boolean(user.smsConsent), handle: user.handle, avatar: user.avatar || '', cover: user.cover || '', bio: user.bio || '', verified: user.verified, createdAt: user.createdAt });
+const publicUser = (user) => { const { email: _email, phone: _phone, smsConsent: _smsConsent, ...profile } = safeUser(user); return profile; };
 const makeToken = (user) => {
   const payload = Buffer.from(JSON.stringify({ sub: user.id, exp: Date.now() + 7 * 24 * 60 * 60 * 1000 })).toString('base64url');
   const signature = createHmac('sha256', process.env.SESSION_SECRET).update(payload).digest('base64url');
@@ -60,8 +60,11 @@ const auth = (req, res, next) => {
   req.user = user;
   next();
 };
-const signUpSchema = (body) => typeof body.name === 'string' && body.name.trim().length >= 2 && body.name.trim().length <= 60 && typeof body.email === 'string' && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(body.email) && typeof body.password === 'string' && body.password.length >= 8 && body.password.length <= 128;
+const isE164Phone = (phone) => typeof phone === 'string' && /^\+[1-9]\d{7,14}$/.test(phone);
+const signUpSchema = (body) => typeof body.name === 'string' && body.name.trim().length >= 2 && body.name.trim().length <= 60 && typeof body.email === 'string' && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(body.email) && typeof body.password === 'string' && body.password.length >= 8 && body.password.length <= 128 && (body.phone == null || body.phone === '' || (isE164Phone(body.phone) && body.smsConsent === true));
 const rateLimitOtp = (email) => { const now = Date.now(); const prior = otpThrottle.get(email) || []; const recent = prior.filter((stamp) => now - stamp < 15 * 60_000); if (recent.length >= 5) return false; recent.push(now); otpThrottle.set(email, recent); return true; };
+const smsThrottle = new Map();
+const rateLimitSms = (phone) => { const now = Date.now(); const prior = smsThrottle.get(phone) || []; const recent = prior.filter((stamp) => now - stamp < 15 * 60_000); if (recent.length >= 3) return false; recent.push(now); smsThrottle.set(phone, recent); return true; };
 const smtpPort = Number(process.env.SMTP_PORT || 587);
 const mailer = process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS ? nodemailer.createTransport({ host: process.env.SMTP_HOST, port: smtpPort, secure: process.env.SMTP_SECURE === 'true', connectionTimeout: 8_000, greetingTimeout: 8_000, socketTimeout: 12_000, auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS } }) : null;
 const resendApiKey = process.env.RESEND_API_KEY;
@@ -69,6 +72,36 @@ const resendFrom = process.env.RESEND_FROM;
 const renderBlocksSmtp = Boolean(process.env.RENDER_EXTERNAL_URL && [25, 465, 587].includes(smtpPort));
 const emailConfigured = Boolean((resendApiKey && resendFrom) || (mailer && !renderBlocksSmtp));
 const emailProvider = resendApiKey ? 'resend' : mailer && !renderBlocksSmtp ? 'smtp' : renderBlocksSmtp ? 'smtp-blocked' : 'unconfigured';
+const twilioAccountSid = process.env.TWILIO_ACCOUNT_SID;
+const twilioAuthToken = process.env.TWILIO_AUTH_TOKEN;
+const twilioVerifyServiceSid = process.env.TWILIO_VERIFY_SERVICE_SID;
+const smsConfigured = Boolean(twilioAccountSid && twilioAuthToken && twilioVerifyServiceSid);
+const twilioAuthorization = `Basic ${Buffer.from(`${twilioAccountSid}:${twilioAuthToken}`).toString('base64')}`;
+const twilioVerifyUrl = `https://verify.twilio.com/v2/Services/${twilioVerifyServiceSid}`;
+const sendSmsVerification = async (phone) => {
+  if (!smsConfigured) throw new Error('SMS fallback is not configured.');
+  if (!rateLimitSms(phone)) throw new Error('Too many SMS codes requested for this phone. Try again in 15 minutes.');
+  const response = await fetch(`${twilioVerifyUrl}/Verifications`, {
+    method: 'POST',
+    headers: { Authorization: twilioAuthorization, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ To: phone, Channel: 'sms' }),
+    signal: AbortSignal.timeout(10_000),
+  });
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(result.message || `Twilio Verify request failed (${response.status}).`);
+};
+const verifySmsCode = async (phone, code) => {
+  const response = await fetch(`${twilioVerifyUrl}/VerificationCheck`, {
+    method: 'POST',
+    headers: { Authorization: twilioAuthorization, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ To: phone, Code: String(code || '') }),
+    signal: AbortSignal.timeout(10_000),
+  });
+  const result = await response.json().catch(() => ({}));
+  if (response.status === 401 || response.status === 403) throw new Error('SMS verification provider credentials are invalid. Check the Twilio Verify settings.');
+  if (!response.ok && response.status >= 500) throw new Error('SMS verification is temporarily unavailable. Try again.');
+  return response.ok && result.status === 'approved';
+};
 const sendVerificationEmail = async (user, code) => {
   const text = `Your Nexo verification code is ${code}. It expires in 10 minutes. If you did not request this, you can ignore this email.`;
   if (resendApiKey) {
@@ -102,25 +135,31 @@ const issueChallenge = async (user, purpose, res) => {
   store.challenges = store.challenges.filter((item) => item.expiresAt > Date.now());
   store.challenges.push(challenge); persist();
   const discardChallenge = () => { store.challenges = store.challenges.filter((item) => item.id !== challenge.id); if (purpose === 'signup') store.users = store.users.filter((item) => item.id !== user.id); persist(); };
-  try {
-    const delivery = await sendVerificationEmail(user, code);
-    return res.json({ challengeId: challenge.id, email: user.email, ...(delivery === 'development' ? { devCode: code } : {}) });
-  } catch (error) {
-    console.error('Email delivery failed:', error.message);
-    discardChallenge();
-    const message = error.message.includes('Render Free blocks outbound SMTP')
-      ? error.message
-      : error.message.startsWith('Set RESEND_')
-        ? error.message
-        : resendApiKey
-          ? 'Resend could not deliver this email. Check the API key and verified sender address.'
-          : 'We could not deliver your verification code. Check email settings and try again.';
-    const status = !emailConfigured && !resendApiKey ? 503 : 502;
-    return res.status(status).json({ error: message });
+  let delivery;
+  let emailError;
+  if (emailConfigured) {
+    try { delivery = await sendVerificationEmail(user, code); }
+    catch (error) { emailError = error; console.error('Email delivery failed:', error.message); }
   }
+  if (!delivery && user.phone && user.smsConsent && smsConfigured) {
+    try { await sendSmsVerification(user.phone); challenge.provider = 'twilio'; challenge.phone = user.phone; persist(); delivery = 'sms'; }
+    catch (error) { console.error('SMS fallback failed:', error.message); }
+  }
+  if (!delivery && dev) {
+    console.info(`[Nexo local OTP] ${email}: ${code}`);
+    delivery = 'development';
+  }
+  if (!delivery) {
+    discardChallenge();
+    if (resendApiKey && !resendFrom) return res.status(503).json({ error: 'Set RESEND_FROM to an address on a domain verified with Resend.' });
+    if (renderBlocksSmtp && !smsConfigured && !resendApiKey) return res.status(503).json({ error: 'Render Free blocks SMTP delivery. Configure Resend over HTTPS or Twilio Verify SMS to enable sign-in.' });
+    if (!emailConfigured && !smsConfigured) return res.status(503).json({ error: 'Email/SMS verification is not configured. Add Resend or Twilio Verify credentials.' });
+    return res.status(502).json({ error: smsConfigured && user.phone ? 'Email and SMS delivery both failed. Check the provider settings and try again.' : emailError?.message || 'We could not deliver your verification code. Check email settings and try again.' });
+  }
+  return res.json({ challengeId: challenge.id, email: user.email, channel: delivery === 'sms' ? 'sms' : delivery === 'development' ? 'development' : 'email', ...(delivery === 'development' ? { devCode: code } : {}) });
 };
 
-app.get('/api/health', (_req, res) => { const ai = getAiSettings(); res.json({ ok: true, aiConfigured: Boolean(ai.apiKey && ai.model), aiProvider: ai.provider, emailConfigured, emailProvider }); });
+app.get('/api/health', (_req, res) => { const ai = getAiSettings(); res.json({ ok: true, aiConfigured: Boolean(ai.apiKey && ai.model), aiProvider: ai.provider, emailConfigured, emailProvider, smsConfigured }); });
 app.post('/api/auth/signup', async (req, res) => {
   const body = req.body || {};
   if (!signUpSchema(body)) return res.status(400).json({ error: 'Enter a name, valid email, and password with at least 8 characters.' });
@@ -130,7 +169,7 @@ app.post('/api/auth/signup', async (req, res) => {
   const passwordHash = (await scrypt(body.password, salt, 64)).toString('hex');
   const baseHandle = email.split('@')[0].toLowerCase().replace(/[^a-z0-9_]/g, '').slice(0, 20) || 'friend';
   const handle = `${baseHandle}${randomInt(10, 99)}`;
-  const user = { id: randomBytes(16).toString('hex'), name: body.name.trim(), email, handle, avatar: '', cover: '', bio: '', salt, passwordHash, verified: false, createdAt: new Date().toISOString() };
+  const user = { id: randomBytes(16).toString('hex'), name: body.name.trim(), email, phone: body.phone?.trim() || '', smsConsent: Boolean(body.phone && body.smsConsent), handle, avatar: '', cover: '', bio: '', salt, passwordHash, verified: false, createdAt: new Date().toISOString() };
   store.users.push(user);
   try { await issueChallenge(user, 'signup', res); }
   catch (error) { store.users = store.users.filter((item) => item.id !== user.id); persist(); console.error(error); if (!res.headersSent) res.status(500).json({ error: 'Could not create the account.' }); }
@@ -145,15 +184,22 @@ app.post('/api/auth/login', async (req, res) => {
   if (candidate.length !== expected.length || !timingSafeEqual(candidate, expected)) return res.status(401).json({ error: 'Email or password is incorrect.' });
   return issueChallenge(user, 'login', res);
 });
-app.post('/api/auth/verify', (req, res) => {
+app.post('/api/auth/verify', async (req, res) => {
   const { challengeId, code } = req.body || {};
   const challenge = store.challenges.find((item) => item.id === challengeId && item.expiresAt > Date.now());
   if (!challenge) return res.status(400).json({ error: 'That code has expired. Request a new one.' });
   if (challenge.attempts >= 5) { store.challenges = store.challenges.filter((item) => item.id !== challenge.id); persist(); return res.status(429).json({ error: 'Too many attempts. Request a new code.' }); }
   challenge.attempts += 1;
-  const candidate = createHmac('sha256', process.env.SESSION_SECRET).update(String(code || '')).digest('hex');
-  const expectedCode = Buffer.from(challenge.codeHash, 'hex'); const suppliedCode = Buffer.from(candidate, 'hex');
-  if (expectedCode.length !== suppliedCode.length || !timingSafeEqual(expectedCode, suppliedCode)) { persist(); return res.status(400).json({ error: 'That code does not match. Try again.' }); }
+  let codeMatches = false;
+  if (challenge.provider === 'twilio') {
+    try { codeMatches = await verifySmsCode(challenge.phone, code); }
+    catch (error) { persist(); return res.status(502).json({ error: error.message }); }
+  } else {
+    const candidate = createHmac('sha256', process.env.SESSION_SECRET).update(String(code || '')).digest('hex');
+    const expectedCode = Buffer.from(challenge.codeHash, 'hex'); const suppliedCode = Buffer.from(candidate, 'hex');
+    codeMatches = expectedCode.length === suppliedCode.length && timingSafeEqual(expectedCode, suppliedCode);
+  }
+  if (!codeMatches) { persist(); return res.status(400).json({ error: 'That code does not match. Try again.' }); }
   const user = store.users.find((item) => item.id === challenge.userId);
   if (!user) return res.status(400).json({ error: 'This account could not be found.' });
   user.verified = true;
@@ -163,9 +209,11 @@ app.post('/api/auth/verify', (req, res) => {
 });
 app.get('/api/me', auth, (req, res) => res.json({ user: safeUser(req.user) }));
 app.patch('/api/me', auth, (req, res) => {
-  const { name, bio, avatar, cover } = req.body || {};
+  const { name, bio, avatar, cover, phone, smsConsent } = req.body || {};
   if (typeof name === 'string') { if (name.trim().length < 2 || name.trim().length > 60) return res.status(400).json({ error: 'Name must be 2 to 60 characters.' }); req.user.name = name.trim(); }
   if (typeof bio === 'string') req.user.bio = bio.slice(0, 140);
+  if (typeof phone === 'string') { if (phone && !isE164Phone(phone)) return res.status(400).json({ error: 'Use an international phone number such as +15551234567.' }); req.user.phone = phone; if (!phone) req.user.smsConsent = false; }
+  if (typeof smsConsent === 'boolean') req.user.smsConsent = Boolean(req.user.phone && smsConsent);
   if (typeof avatar === 'string' && (avatar.startsWith('data:image/') || avatar.startsWith('/uploads/'))) req.user.avatar = avatar;
   if (typeof cover === 'string' && (cover.startsWith('data:image/') || cover.startsWith('/uploads/'))) req.user.cover = cover;
   persist(); res.json({ user: safeUser(req.user) });

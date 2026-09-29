@@ -17,6 +17,7 @@ Copy `.env.example` to `.env`, then set a long random `SESSION_SECRET`.
 
 - For Render Free, configure `RESEND_API_KEY` and `RESEND_FROM` to deliver signup and login codes over HTTPS. `RESEND_FROM` must be an address on a domain verified with Resend. Render Free blocks outbound SMTP ports 25, 465, and 587.
 - On hosts that permit SMTP, configure `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS`, and `EMAIL_FROM`. In production, email delivery must be configured; development-only codes are never returned in production.
+- To offer opt-in SMS fallback when email delivery fails, configure `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, and `TWILIO_VERIFY_SERVICE_SID`. Users must add an E.164 phone number and consent to SMS. Twilio Verify may charge per verification/SMS; create and configure the service in Twilio first.
 - Set `AI_PROVIDER=nebius`, then configure `NEBIUS_API_KEY` and `NEBIUS_MODEL` to use Nebius Token Factory for the Nexo AI conversation. The default endpoint is `https://api.tokenfactory.nebius.com/v1/`. Set the model ID available in your Nebius account. An optional OpenAI-compatible provider is available through `OPENAI_API_KEY`, `OPENAI_BASE_URL`, and `OPENAI_MODEL` with `AI_PROVIDER=openai`.
 - Video calls use browser WebRTC, camera/microphone permissions, and a public STUN server. Configure `TURN_URL`, `TURN_USERNAME`, and `TURN_CREDENTIAL` in a restrictive or production network so calls can relay through a TURN server.
 - Set `NODE_ENV=production` and `PORT` for deployment. Run `npm run build` before `npm start`; the API serves the production client from `dist`.
@@ -31,7 +32,7 @@ After deployment, add `RESEND_API_KEY` and `RESEND_FROM` in the Render service e
 
 ## Included workflows
 
-- Signup and login with hashed passwords and expiring, attempt-limited email codes
+- Signup and login with hashed passwords and expiring, attempt-limited email codes, with optional consent-based Twilio SMS fallback
 - User profiles with uploaded profile and cover images
 - Shared posts, comments, likes, reposts, saved posts, and 24-hour statuses
 - Persistent one-to-one text and voice messages with Socket.IO delivery
