@@ -22,6 +22,12 @@ Copy `.env.example` to `.env`, then set a long random `SESSION_SECRET`.
 
 Use HTTPS in deployment for camera, microphone, and secure session handling. Keep `.env`, user data, and uploaded files private. The included JSON store is designed for a single-process starter deployment; move the store to a transactional database and uploads to private object storage before scaling to multiple instances.
 
+## Deploy to Render
+
+The included `render.yaml` defines a free Node web service that builds the client, starts the API, and checks `/api/health`. Create a Render Blueprint from this GitHub repository to launch it. The free service can sleep when idle, and its filesystem is ephemeral: accounts, posts, and uploads may be lost when the service restarts or redeploys. Use a paid persistent disk or migrate to a managed database and object storage before relying on it for real users.
+
+After deployment, add `NEBIUS_API_KEY` and `NEBIUS_MODEL` in the Render service environment to enable AI replies. Add SMTP settings there to enable email OTP delivery. Never commit these credentials.
+
 ## Included workflows
 
 - Signup and login with hashed passwords and expiring, attempt-limited email codes

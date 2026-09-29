@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: nexo-chat
+    runtime: node
+    plan: free
+    buildCommand: npm ci && npm run build
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: SESSION_SECRET
+        generateValue: true
+      - key: CLIENT_ORIGIN
+        value: https://nexo-chat.onrender.com
+      - key: AI_PROVIDER
+        value: nebius
+      - key: NEBIUS_BASE_URL
+        value: https://api.tokenfactory.nebius.com/v1/
