@@ -2,7 +2,6 @@ import 'dotenv/config';
 import express from 'express';
 import http from 'node:http';
 import { Server as SocketServer } from 'socket.io';
-import nodemailer from 'nodemailer';
 import multer from 'multer';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -17,7 +16,7 @@ const uploadDir = path.join(root, 'uploads');
 const storePath = path.join(dataDir, 'store.json');
 mkdirSync(dataDir, { recursive: true });
 mkdirSync(uploadDir, { recursive: true });
-if (!existsSync(storePath)) writeFileSync(storePath, JSON.stringify({ users: [], challenges: [], posts: [], messages: [], statuses: [] }, null, 2));
+if (!existsSync(storePath)) writeFileSync(storePath, JSON.stringify({ users: [], posts: [], messages: [], statuses: [] }, null, 2));
 let store = JSON.parse(readFileSync(storePath, 'utf8'));
 const persist = () => { const temp = `${storePath}.tmp`; writeFileSync(temp, JSON.stringify(store, null, 2)); renameSync(temp, storePath); };
 const app = express();
@@ -26,7 +25,6 @@ const socketOrigins = [process.env.CLIENT_ORIGIN, process.env.RENDER_EXTERNAL_UR
 const io = new SocketServer(server, { cors: { origin: socketOrigins.length ? socketOrigins : 'http://localhost:5173' } });
 const socketsByUser = new Map();
 const dev = process.env.NODE_ENV !== 'production';
-const otpThrottle = new Map();
 app.use(express.json({ limit: '8mb' }));
 app.use('/uploads', express.static(uploadDir, { maxAge: '1d' }));
 app.use(express.static(path.resolve(root, '../dist')));
@@ -37,8 +35,8 @@ const getAiSettings = () => {
     : { provider: 'openai', apiKey: process.env.OPENAI_API_KEY, endpoint: process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1', model: process.env.OPENAI_MODEL || 'gpt-4o-mini' };
 };
 
-const safeUser = (user) => ({ id: user.id, name: user.name, email: user.email, phone: user.phone || '', smsConsent: Boolean(user.smsConsent), handle: user.handle, avatar: user.avatar || '', cover: user.cover || '', bio: user.bio || '', verified: user.verified, createdAt: user.createdAt });
-const publicUser = (user) => { const { email: _email, phone: _phone, smsConsent: _smsConsent, ...profile } = safeUser(user); return profile; };
+const safeUser = (user) => ({ id: user.id, name: user.name, email: user.email, handle: user.handle, avatar: user.avatar || '', cover: user.cover || '', bio: user.bio || '', createdAt: user.createdAt });
+const publicUser = (user) => { const { email: _email, ...profile } = safeUser(user); return profile; };
 const makeToken = (user) => {
   const payload = Buffer.from(JSON.stringify({ sub: user.id, exp: Date.now() + 7 * 24 * 60 * 60 * 1000 })).toString('base64url');
   const signature = createHmac('sha256', process.env.SESSION_SECRET).update(payload).digest('base64url');
@@ -60,106 +58,8 @@ const auth = (req, res, next) => {
   req.user = user;
   next();
 };
-const isE164Phone = (phone) => typeof phone === 'string' && /^\+[1-9]\d{7,14}$/.test(phone);
-const signUpSchema = (body) => typeof body.name === 'string' && body.name.trim().length >= 2 && body.name.trim().length <= 60 && typeof body.email === 'string' && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(body.email) && typeof body.password === 'string' && body.password.length >= 8 && body.password.length <= 128 && (body.phone == null || body.phone === '' || (isE164Phone(body.phone) && body.smsConsent === true));
-const rateLimitOtp = (email) => { const now = Date.now(); const prior = otpThrottle.get(email) || []; const recent = prior.filter((stamp) => now - stamp < 15 * 60_000); if (recent.length >= 5) return false; recent.push(now); otpThrottle.set(email, recent); return true; };
-const smsThrottle = new Map();
-const rateLimitSms = (phone) => { const now = Date.now(); const prior = smsThrottle.get(phone) || []; const recent = prior.filter((stamp) => now - stamp < 15 * 60_000); if (recent.length >= 3) return false; recent.push(now); smsThrottle.set(phone, recent); return true; };
-const smtpPort = Number(process.env.SMTP_PORT || 587);
-const mailer = process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS ? nodemailer.createTransport({ host: process.env.SMTP_HOST, port: smtpPort, secure: process.env.SMTP_SECURE === 'true', connectionTimeout: 8_000, greetingTimeout: 8_000, socketTimeout: 12_000, auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS } }) : null;
-const resendApiKey = process.env.RESEND_API_KEY;
-const resendFrom = process.env.RESEND_FROM;
-const renderBlocksSmtp = Boolean(process.env.RENDER_EXTERNAL_URL && [25, 465, 587].includes(smtpPort));
-const emailConfigured = Boolean((resendApiKey && resendFrom) || (mailer && !renderBlocksSmtp));
-const emailProvider = resendApiKey ? 'resend' : mailer && !renderBlocksSmtp ? 'smtp' : renderBlocksSmtp ? 'smtp-blocked' : 'unconfigured';
-const twilioAccountSid = process.env.TWILIO_ACCOUNT_SID;
-const twilioAuthToken = process.env.TWILIO_AUTH_TOKEN;
-const twilioVerifyServiceSid = process.env.TWILIO_VERIFY_SERVICE_SID;
-const smsConfigured = Boolean(twilioAccountSid && twilioAuthToken && twilioVerifyServiceSid);
-const twilioAuthorization = `Basic ${Buffer.from(`${twilioAccountSid}:${twilioAuthToken}`).toString('base64')}`;
-const twilioVerifyUrl = `https://verify.twilio.com/v2/Services/${twilioVerifyServiceSid}`;
-const sendSmsVerification = async (phone) => {
-  if (!smsConfigured) throw new Error('SMS fallback is not configured.');
-  if (!rateLimitSms(phone)) throw new Error('Too many SMS codes requested for this phone. Try again in 15 minutes.');
-  const response = await fetch(`${twilioVerifyUrl}/Verifications`, {
-    method: 'POST',
-    headers: { Authorization: twilioAuthorization, 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({ To: phone, Channel: 'sms' }),
-    signal: AbortSignal.timeout(10_000),
-  });
-  const result = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(result.message || `Twilio Verify request failed (${response.status}).`);
-};
-const verifySmsCode = async (phone, code) => {
-  const response = await fetch(`${twilioVerifyUrl}/VerificationCheck`, {
-    method: 'POST',
-    headers: { Authorization: twilioAuthorization, 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({ To: phone, Code: String(code || '') }),
-    signal: AbortSignal.timeout(10_000),
-  });
-  const result = await response.json().catch(() => ({}));
-  if (response.status === 401 || response.status === 403) throw new Error('SMS verification provider credentials are invalid. Check the Twilio Verify settings.');
-  if (!response.ok && response.status >= 500) throw new Error('SMS verification is temporarily unavailable. Try again.');
-  return response.ok && result.status === 'approved';
-};
-const sendVerificationEmail = async (user, code) => {
-  const text = `Your Nexo verification code is ${code}. It expires in 10 minutes. If you did not request this, you can ignore this email.`;
-  if (resendApiKey) {
-    if (!resendFrom) throw new Error('Set RESEND_FROM to a sender address on a verified domain.');
-    const response = await fetch('https://api.resend.com/emails', {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${resendApiKey}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ from: resendFrom, to: [user.email], subject: 'Your Nexo verification code', text }),
-      signal: AbortSignal.timeout(10_000),
-    });
-    const result = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(result.message || `Resend request failed (${response.status}).`);
-    return 'resend';
-  }
-  if (mailer && !renderBlocksSmtp) {
-    await mailer.sendMail({ from: process.env.EMAIL_FROM || process.env.SMTP_USER, to: user.email, subject: 'Your Nexo verification code', text });
-    return 'smtp';
-  }
-  if (renderBlocksSmtp) throw new Error('Render Free blocks outbound SMTP. Configure RESEND_API_KEY and RESEND_FROM to send email over HTTPS.');
-  if (dev) {
-    console.info(`[Nexo local OTP] ${user.email.toLowerCase()}: ${code}`);
-    return 'development';
-  }
-  throw new Error('Set RESEND_API_KEY and RESEND_FROM, or configure SMTP on a host that allows outbound SMTP.');
-};
-const issueChallenge = async (user, purpose, res) => {
-  const email = user.email.toLowerCase();
-  if (!rateLimitOtp(email)) return res.status(429).json({ error: 'Too many codes requested. Try again in 15 minutes.' });
-  const code = String(randomInt(0, 1_000_000)).padStart(6, '0');
-  const challenge = { id: randomBytes(24).toString('hex'), userId: user.id, purpose, codeHash: createHmac('sha256', process.env.SESSION_SECRET).update(code).digest('hex'), expiresAt: Date.now() + 10 * 60_000, attempts: 0 };
-  store.challenges = store.challenges.filter((item) => item.expiresAt > Date.now());
-  store.challenges.push(challenge); persist();
-  const discardChallenge = () => { store.challenges = store.challenges.filter((item) => item.id !== challenge.id); if (purpose === 'signup') store.users = store.users.filter((item) => item.id !== user.id); persist(); };
-  let delivery;
-  let emailError;
-  if (emailConfigured) {
-    try { delivery = await sendVerificationEmail(user, code); }
-    catch (error) { emailError = error; console.error('Email delivery failed:', error.message); }
-  }
-  if (!delivery && user.phone && user.smsConsent && smsConfigured) {
-    try { await sendSmsVerification(user.phone); challenge.provider = 'twilio'; challenge.phone = user.phone; persist(); delivery = 'sms'; }
-    catch (error) { console.error('SMS fallback failed:', error.message); }
-  }
-  if (!delivery && dev) {
-    console.info(`[Nexo local OTP] ${email}: ${code}`);
-    delivery = 'development';
-  }
-  if (!delivery) {
-    discardChallenge();
-    if (resendApiKey && !resendFrom) return res.status(503).json({ error: 'Set RESEND_FROM to an address on a domain verified with Resend.' });
-    if (renderBlocksSmtp && !smsConfigured && !resendApiKey) return res.status(503).json({ error: 'Render Free blocks SMTP delivery. Configure Resend over HTTPS or Twilio Verify SMS to enable sign-in.' });
-    if (!emailConfigured && !smsConfigured) return res.status(503).json({ error: 'Email/SMS verification is not configured. Add Resend or Twilio Verify credentials.' });
-    return res.status(502).json({ error: smsConfigured && user.phone ? 'Email and SMS delivery both failed. Check the provider settings and try again.' : emailError?.message || 'We could not deliver your verification code. Check email settings and try again.' });
-  }
-  return res.json({ challengeId: challenge.id, email: user.email, channel: delivery === 'sms' ? 'sms' : delivery === 'development' ? 'development' : 'email', ...(delivery === 'development' ? { devCode: code } : {}) });
-};
-
-app.get('/api/health', (_req, res) => { const ai = getAiSettings(); res.json({ ok: true, aiConfigured: Boolean(ai.apiKey && ai.model), aiProvider: ai.provider, emailConfigured, emailProvider, smsConfigured }); });
+const signUpSchema = (body) => typeof body.name === 'string' && body.name.trim().length >= 2 && body.name.trim().length <= 60 && typeof body.email === 'string' && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(body.email) && typeof body.password === 'string' && body.password.length >= 8 && body.password.length <= 128;
+app.get('/api/health', (_req, res) => { const ai = getAiSettings(); res.json({ ok: true, aiConfigured: Boolean(ai.apiKey && ai.model), aiProvider: ai.provider }); });
 app.post('/api/auth/signup', async (req, res) => {
   const body = req.body || {};
   if (!signUpSchema(body)) return res.status(400).json({ error: 'Enter a name, valid email, and password with at least 8 characters.' });
@@ -169,56 +69,31 @@ app.post('/api/auth/signup', async (req, res) => {
   const passwordHash = (await scrypt(body.password, salt, 64)).toString('hex');
   const baseHandle = email.split('@')[0].toLowerCase().replace(/[^a-z0-9_]/g, '').slice(0, 20) || 'friend';
   const handle = `${baseHandle}${randomInt(10, 99)}`;
-  const user = { id: randomBytes(16).toString('hex'), name: body.name.trim(), email, phone: body.phone?.trim() || '', smsConsent: Boolean(body.phone && body.smsConsent), handle, avatar: '', cover: '', bio: '', salt, passwordHash, verified: false, createdAt: new Date().toISOString() };
+  const user = { id: randomBytes(16).toString('hex'), name: body.name.trim(), email, handle, avatar: '', cover: '', bio: '', salt, passwordHash, createdAt: new Date().toISOString() };
   store.users.push(user);
-  try { await issueChallenge(user, 'signup', res); }
-  catch (error) { store.users = store.users.filter((item) => item.id !== user.id); persist(); console.error(error); if (!res.headersSent) res.status(500).json({ error: 'Could not create the account.' }); }
+  persist();
+  return res.status(201).json({ token: makeToken(user), user: safeUser(user) });
 });
 app.post('/api/auth/login', async (req, res) => {
   const email = typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : '';
   const password = typeof req.body?.password === 'string' ? req.body.password : '';
   const user = store.users.find((item) => item.email === email);
-  if (!user || !user.verified) return res.status(401).json({ error: 'No verified account found for that email.' });
+  if (!user) return res.status(401).json({ error: 'Email or password is incorrect.' });
   const candidate = (await scrypt(password, user.salt, 64));
   const expected = Buffer.from(user.passwordHash, 'hex');
   if (candidate.length !== expected.length || !timingSafeEqual(candidate, expected)) return res.status(401).json({ error: 'Email or password is incorrect.' });
-  return issueChallenge(user, 'login', res);
-});
-app.post('/api/auth/verify', async (req, res) => {
-  const { challengeId, code } = req.body || {};
-  const challenge = store.challenges.find((item) => item.id === challengeId && item.expiresAt > Date.now());
-  if (!challenge) return res.status(400).json({ error: 'That code has expired. Request a new one.' });
-  if (challenge.attempts >= 5) { store.challenges = store.challenges.filter((item) => item.id !== challenge.id); persist(); return res.status(429).json({ error: 'Too many attempts. Request a new code.' }); }
-  challenge.attempts += 1;
-  let codeMatches = false;
-  if (challenge.provider === 'twilio') {
-    try { codeMatches = await verifySmsCode(challenge.phone, code); }
-    catch (error) { persist(); return res.status(502).json({ error: error.message }); }
-  } else {
-    const candidate = createHmac('sha256', process.env.SESSION_SECRET).update(String(code || '')).digest('hex');
-    const expectedCode = Buffer.from(challenge.codeHash, 'hex'); const suppliedCode = Buffer.from(candidate, 'hex');
-    codeMatches = expectedCode.length === suppliedCode.length && timingSafeEqual(expectedCode, suppliedCode);
-  }
-  if (!codeMatches) { persist(); return res.status(400).json({ error: 'That code does not match. Try again.' }); }
-  const user = store.users.find((item) => item.id === challenge.userId);
-  if (!user) return res.status(400).json({ error: 'This account could not be found.' });
-  user.verified = true;
-  store.challenges = store.challenges.filter((item) => item.id !== challenge.id);
-  persist();
   return res.json({ token: makeToken(user), user: safeUser(user) });
 });
 app.get('/api/me', auth, (req, res) => res.json({ user: safeUser(req.user) }));
 app.patch('/api/me', auth, (req, res) => {
-  const { name, bio, avatar, cover, phone, smsConsent } = req.body || {};
+  const { name, bio, avatar, cover } = req.body || {};
   if (typeof name === 'string') { if (name.trim().length < 2 || name.trim().length > 60) return res.status(400).json({ error: 'Name must be 2 to 60 characters.' }); req.user.name = name.trim(); }
   if (typeof bio === 'string') req.user.bio = bio.slice(0, 140);
-  if (typeof phone === 'string') { if (phone && !isE164Phone(phone)) return res.status(400).json({ error: 'Use an international phone number such as +15551234567.' }); req.user.phone = phone; if (!phone) req.user.smsConsent = false; }
-  if (typeof smsConsent === 'boolean') req.user.smsConsent = Boolean(req.user.phone && smsConsent);
   if (typeof avatar === 'string' && (avatar.startsWith('data:image/') || avatar.startsWith('/uploads/'))) req.user.avatar = avatar;
   if (typeof cover === 'string' && (cover.startsWith('data:image/') || cover.startsWith('/uploads/'))) req.user.cover = cover;
   persist(); res.json({ user: safeUser(req.user) });
 });
-app.get('/api/users', auth, (_req, res) => res.json(store.users.filter((user) => user.verified).map((user) => ({ ...publicUser(user), online: socketsByUser.has(user.id) }))));
+app.get('/api/users', auth, (_req, res) => res.json(store.users.map((user) => ({ ...publicUser(user), online: socketsByUser.has(user.id) }))));
 app.get('/api/calls/ice-servers', auth, (_req, res) => {
   const iceServers = [{ urls: 'stun:stun.l.google.com:19302' }];
   if (process.env.TURN_URL && process.env.TURN_USERNAME && process.env.TURN_CREDENTIAL) iceServers.push({ urls: process.env.TURN_URL.split(',').map((url) => url.trim()), username: process.env.TURN_USERNAME, credential: process.env.TURN_CREDENTIAL });
@@ -248,7 +123,7 @@ app.patch('/api/posts/:id', auth, (req, res) => {
 
 app.get('/api/messages', auth, (req, res) => res.json(store.messages.filter((message) => message.from === req.user.id || message.to === req.user.id)));
 const deliverMessage = (sender, { to, text, audio }) => {
-  if (typeof to !== 'string' || !store.users.some((user) => user.id === to && user.verified) || to === sender.id) return null;
+  if (typeof to !== 'string' || !store.users.some((user) => user.id === to) || to === sender.id) return null;
   if (!(typeof text === 'string' && text.trim()) && typeof audio !== 'string') return null;
   const message = { id: randomBytes(12).toString('hex'), from: sender.id, fromName: sender.name, fromAvatar: sender.avatar, to, text: typeof text === 'string' ? text.trim().slice(0, 4000) : '', audio: typeof audio === 'string' && audio.startsWith('/uploads/') ? audio : '', time: new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }), createdAt: new Date().toISOString() };
   store.messages.push(message); persist();
@@ -298,10 +173,10 @@ io.on('connection', (socket) => {
   socketsByUser.get(userId).add(socket);
   io.emit('presence:update', { id: userId, online: true });
   socket.on('direct:message', (payload) => { const message = deliverMessage(socket.user, payload || {}); if (message) socket.emit('direct:sent', message); });
-  socket.on('call:invite', ({ to, audioOnly }) => { if (!store.users.some((user) => user.id === to && user.verified)) return; socketsByUser.get(to)?.forEach((recipient) => recipient.emit('call:incoming', { from: publicUser(socket.user), audioOnly: Boolean(audioOnly) })); });
+  socket.on('call:invite', ({ to, audioOnly }) => { if (!store.users.some((user) => user.id === to)) return; socketsByUser.get(to)?.forEach((recipient) => recipient.emit('call:incoming', { from: publicUser(socket.user), audioOnly: Boolean(audioOnly) })); });
   socket.on('call:accept', ({ to }) => socketsByUser.get(to)?.forEach((recipient) => recipient.emit('call:ready', { from: userId })));
   socket.on('call:reject', ({ to }) => socketsByUser.get(to)?.forEach((recipient) => recipient.emit('call:ended', { reason: 'declined' })));
-  socket.on('call:signal', ({ to, description, candidate }) => { if (!store.users.some((user) => user.id === to && user.verified)) return; socketsByUser.get(to)?.forEach((recipient) => recipient.emit('call:signal', { from: userId, description, candidate })); });
+  socket.on('call:signal', ({ to, description, candidate }) => { if (!store.users.some((user) => user.id === to)) return; socketsByUser.get(to)?.forEach((recipient) => recipient.emit('call:signal', { from: userId, description, candidate })); });
   socket.on('call:hangup', ({ to }) => socketsByUser.get(to)?.forEach((recipient) => recipient.emit('call:ended', { reason: 'ended' })));
   socket.on('disconnect', () => { socketsByUser.get(userId)?.delete(socket); if (!socketsByUser.get(userId)?.size) { socketsByUser.delete(userId); io.emit('presence:update', { id: userId, online: false }); } });
 });
