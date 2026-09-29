@@ -64,6 +64,36 @@ const signUpSchema = (body) => typeof body.name === 'string' && body.name.trim()
 const rateLimitOtp = (email) => { const now = Date.now(); const prior = otpThrottle.get(email) || []; const recent = prior.filter((stamp) => now - stamp < 15 * 60_000); if (recent.length >= 5) return false; recent.push(now); otpThrottle.set(email, recent); return true; };
 const smtpPort = Number(process.env.SMTP_PORT || 587);
 const mailer = process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS ? nodemailer.createTransport({ host: process.env.SMTP_HOST, port: smtpPort, secure: process.env.SMTP_SECURE === 'true', connectionTimeout: 8_000, greetingTimeout: 8_000, socketTimeout: 12_000, auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS } }) : null;
+const resendApiKey = process.env.RESEND_API_KEY;
+const resendFrom = process.env.RESEND_FROM;
+const renderBlocksSmtp = Boolean(process.env.RENDER_EXTERNAL_URL && [25, 465, 587].includes(smtpPort));
+const emailConfigured = Boolean((resendApiKey && resendFrom) || (mailer && !renderBlocksSmtp));
+const emailProvider = resendApiKey ? 'resend' : mailer && !renderBlocksSmtp ? 'smtp' : renderBlocksSmtp ? 'smtp-blocked' : 'unconfigured';
+const sendVerificationEmail = async (user, code) => {
+  const text = `Your Nexo verification code is ${code}. It expires in 10 minutes. If you did not request this, you can ignore this email.`;
+  if (resendApiKey) {
+    if (!resendFrom) throw new Error('Set RESEND_FROM to a sender address on a verified domain.');
+    const response = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${resendApiKey}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from: resendFrom, to: [user.email], subject: 'Your Nexo verification code', text }),
+      signal: AbortSignal.timeout(10_000),
+    });
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(result.message || `Resend request failed (${response.status}).`);
+    return 'resend';
+  }
+  if (mailer && !renderBlocksSmtp) {
+    await mailer.sendMail({ from: process.env.EMAIL_FROM || process.env.SMTP_USER, to: user.email, subject: 'Your Nexo verification code', text });
+    return 'smtp';
+  }
+  if (renderBlocksSmtp) throw new Error('Render Free blocks outbound SMTP. Configure RESEND_API_KEY and RESEND_FROM to send email over HTTPS.');
+  if (dev) {
+    console.info(`[Nexo local OTP] ${user.email.toLowerCase()}: ${code}`);
+    return 'development';
+  }
+  throw new Error('Set RESEND_API_KEY and RESEND_FROM, or configure SMTP on a host that allows outbound SMTP.');
+};
 const issueChallenge = async (user, purpose, res) => {
   const email = user.email.toLowerCase();
   if (!rateLimitOtp(email)) return res.status(429).json({ error: 'Too many codes requested. Try again in 15 minutes.' });
@@ -71,15 +101,26 @@ const issueChallenge = async (user, purpose, res) => {
   const challenge = { id: randomBytes(24).toString('hex'), userId: user.id, purpose, codeHash: createHmac('sha256', process.env.SESSION_SECRET).update(code).digest('hex'), expiresAt: Date.now() + 10 * 60_000, attempts: 0 };
   store.challenges = store.challenges.filter((item) => item.expiresAt > Date.now());
   store.challenges.push(challenge); persist();
-  if (mailer) {
-    try { await mailer.sendMail({ from: process.env.EMAIL_FROM || process.env.SMTP_USER, to: user.email, subject: 'Your Nexo verification code', text: `Your Nexo verification code is ${code}. It expires in 10 minutes. If you did not request this, you can ignore this email.` }); }
-    catch (error) { console.error('Email delivery failed:', error.message); store.challenges = store.challenges.filter((item) => item.id !== challenge.id); if (purpose === 'signup') store.users = store.users.filter((item) => item.id !== user.id); persist(); const renderSmtpError = process.env.RENDER_EXTERNAL_URL && [25, 465, 587].includes(smtpPort); const message = renderSmtpError ? 'This Render service cannot reach SMTP on the configured port. Render Free blocks SMTP ports 25, 465, and 587; use an HTTPS email provider or upgrade the service.' : 'We could not deliver your verification code. Check email settings and try again.'; return res.status(502).json({ error: message }); }
-  } else if (dev) console.info(`[Nexo local OTP] ${email}: ${code}`);
-  else return res.status(503).json({ error: 'Email delivery is not configured. Add SMTP settings before enabling sign-in.' });
-  return res.json({ challengeId: challenge.id, email: user.email, ...(dev && !mailer ? { devCode: code } : {}) });
+  const discardChallenge = () => { store.challenges = store.challenges.filter((item) => item.id !== challenge.id); if (purpose === 'signup') store.users = store.users.filter((item) => item.id !== user.id); persist(); };
+  try {
+    const delivery = await sendVerificationEmail(user, code);
+    return res.json({ challengeId: challenge.id, email: user.email, ...(delivery === 'development' ? { devCode: code } : {}) });
+  } catch (error) {
+    console.error('Email delivery failed:', error.message);
+    discardChallenge();
+    const message = error.message.includes('Render Free blocks outbound SMTP')
+      ? error.message
+      : error.message.startsWith('Set RESEND_')
+        ? error.message
+        : resendApiKey
+          ? 'Resend could not deliver this email. Check the API key and verified sender address.'
+          : 'We could not deliver your verification code. Check email settings and try again.';
+    const status = !emailConfigured && !resendApiKey ? 503 : 502;
+    return res.status(status).json({ error: message });
+  }
 };
 
-app.get('/api/health', (_req, res) => { const ai = getAiSettings(); res.json({ ok: true, aiConfigured: Boolean(ai.apiKey && ai.model), aiProvider: ai.provider, emailConfigured: Boolean(mailer) }); });
+app.get('/api/health', (_req, res) => { const ai = getAiSettings(); res.json({ ok: true, aiConfigured: Boolean(ai.apiKey && ai.model), aiProvider: ai.provider, emailConfigured, emailProvider }); });
 app.post('/api/auth/signup', async (req, res) => {
   const body = req.body || {};
   if (!signUpSchema(body)) return res.status(400).json({ error: 'Enter a name, valid email, and password with at least 8 characters.' });
