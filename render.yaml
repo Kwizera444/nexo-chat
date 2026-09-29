@@ -11,8 +11,6 @@ services:
         value: production
       - key: SESSION_SECRET
         generateValue: true
-      - key: CLIENT_ORIGIN
-        value: https://nexo-chat.onrender.com
       - key: AI_PROVIDER
         value: nebius
       - key: NEBIUS_BASE_URL
