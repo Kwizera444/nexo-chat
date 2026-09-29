@@ -62,7 +62,8 @@ const auth = (req, res, next) => {
 };
 const signUpSchema = (body) => typeof body.name === 'string' && body.name.trim().length >= 2 && body.name.trim().length <= 60 && typeof body.email === 'string' && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(body.email) && typeof body.password === 'string' && body.password.length >= 8 && body.password.length <= 128;
 const rateLimitOtp = (email) => { const now = Date.now(); const prior = otpThrottle.get(email) || []; const recent = prior.filter((stamp) => now - stamp < 15 * 60_000); if (recent.length >= 5) return false; recent.push(now); otpThrottle.set(email, recent); return true; };
-const mailer = process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS ? nodemailer.createTransport({ host: process.env.SMTP_HOST, port: Number(process.env.SMTP_PORT || 587), secure: process.env.SMTP_SECURE === 'true', auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS } }) : null;
+const smtpPort = Number(process.env.SMTP_PORT || 587);
+const mailer = process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS ? nodemailer.createTransport({ host: process.env.SMTP_HOST, port: smtpPort, secure: process.env.SMTP_SECURE === 'true', connectionTimeout: 8_000, greetingTimeout: 8_000, socketTimeout: 12_000, auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS } }) : null;
 const issueChallenge = async (user, purpose, res) => {
   const email = user.email.toLowerCase();
   if (!rateLimitOtp(email)) return res.status(429).json({ error: 'Too many codes requested. Try again in 15 minutes.' });
@@ -72,7 +73,7 @@ const issueChallenge = async (user, purpose, res) => {
   store.challenges.push(challenge); persist();
   if (mailer) {
     try { await mailer.sendMail({ from: process.env.EMAIL_FROM || process.env.SMTP_USER, to: user.email, subject: 'Your Nexo verification code', text: `Your Nexo verification code is ${code}. It expires in 10 minutes. If you did not request this, you can ignore this email.` }); }
-    catch (error) { console.error('Email delivery failed:', error.message); store.challenges = store.challenges.filter((item) => item.id !== challenge.id); if (purpose === 'signup') store.users = store.users.filter((item) => item.id !== user.id); persist(); return res.status(502).json({ error: 'We could not deliver your verification code. Check email settings and try again.' }); }
+    catch (error) { console.error('Email delivery failed:', error.message); store.challenges = store.challenges.filter((item) => item.id !== challenge.id); if (purpose === 'signup') store.users = store.users.filter((item) => item.id !== user.id); persist(); const renderSmtpError = process.env.RENDER_EXTERNAL_URL && [25, 465, 587].includes(smtpPort); const message = renderSmtpError ? 'This Render service cannot reach SMTP on the configured port. Render Free blocks SMTP ports 25, 465, and 587; use an HTTPS email provider or upgrade the service.' : 'We could not deliver your verification code. Check email settings and try again.'; return res.status(502).json({ error: message }); }
   } else if (dev) console.info(`[Nexo local OTP] ${email}: ${code}`);
   else return res.status(503).json({ error: 'Email delivery is not configured. Add SMTP settings before enabling sign-in.' });
   return res.json({ challengeId: challenge.id, email: user.email, ...(dev && !mailer ? { devCode: code } : {}) });
