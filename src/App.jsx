@@ -38,12 +38,23 @@ const seedMessages = {
 };
 const photo = (seed) => `https://images.unsplash.com/${seed}?w=500&h=360&fit=crop`;
 const jsonGet = (key, fallback) => { try { return JSON.parse(localStorage.getItem(key)) ?? fallback; } catch { return fallback; } };
+async function readApiJson(response) {
+  const contentType = response.headers.get('content-type') || '';
+  if (!contentType.toLowerCase().includes('application/json')) {
+    throw new Error('The app server returned an unexpected response. Run `npm run dev` in the project folder, then try again.');
+  }
+  let data;
+  try { data = await response.json(); }
+  catch { throw new Error('The app server returned incomplete JSON. Check the server and try again.'); }
+  if (!response.ok) throw new Error(data.error || `Request failed (${response.status}).`);
+  return data;
+}
 async function uploadImage(dataUrl, token) {
   if (!dataUrl?.startsWith('data:image/')) return dataUrl;
   const blob = await (await fetch(dataUrl)).blob();
   const form = new FormData(); form.append('file', blob, `nexo-${Date.now()}.jpg`);
   const response = await fetch('/api/media', { method: 'POST', headers: { Authorization: `Bearer ${token}` }, body: form });
-  const data = await response.json(); if (!response.ok) throw new Error(data.error || 'Image upload failed.');
+  const data = await readApiJson(response);
   return data.url;
 }
 
@@ -64,8 +75,7 @@ function AuthGate({ onEnter }) {
     event.preventDefault(); setError(''); setBusy(true);
     try {
       const response = await fetch(`${API}/api/auth/${mode}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(form) });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.error || 'Could not start verification.');
+      const data = await readApiJson(response);
       setChallenge(data); setPhase('otp');
     } catch (e) { setError(e.message || 'The server is not available. Try demo mode.'); }
     finally { setBusy(false); }
@@ -74,8 +84,7 @@ function AuthGate({ onEnter }) {
     event.preventDefault(); setError(''); setBusy(true);
     try {
       const response = await fetch(`${API}/api/auth/verify`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ challengeId: challenge?.challengeId, code: form.code }) });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.error || 'That code did not work.');
+      const data = await readApiJson(response);
       localStorage.setItem('nexo-token', data.token);
       localStorage.setItem('nexo-user', JSON.stringify(data.user));
       onEnter({ token: data.token, user: data.user });
@@ -162,8 +171,8 @@ function ChatView({ people, messages, setMessages, user, session, onCall, socket
   useEffect(() => { scrollRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [messages, selected]);
   useEffect(() => { if (!socket) return; const receive = (message) => { setMessages((old) => ({ ...old, [message.from]: [...(old[message.from] || []), message] })); }; socket.on('direct:message', receive); return () => socket.off('direct:message', receive); }, [socket, setMessages]);
   const sendMessage = (event) => { event.preventDefault(); const clean = text.trim(); if (!clean) return; const item = { from: 'me', text: clean, time: new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) }; setMessages((old) => ({ ...old, [selected]: [...(old[selected] || []), item] })); if (selected !== 'ai' && !session?.demo) { if (socket?.connected) socket.emit('direct:message', { to: selected, text: clean }); else fetch('/api/messages', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${session.token}` }, body: JSON.stringify({ to: selected, text: clean }) }).catch(() => toast('Message could not be sent. Check your connection.')); } setText(''); if (selected === 'ai') askAI(clean); };
-  const askAI = async (prompt) => { const thinking = { from: 'ai', text: 'One moment…', time: '', pending: true }; setMessages((old) => ({ ...old, ai: [...(old.ai || []), thinking] })); try { if (session?.demo) throw new Error('AI chat is ready for verified accounts once an AI provider is configured on the server.'); const response = await fetch('/api/ai/chat', { method: 'POST', headers: { 'Content-Type': 'application/json', ...(session?.token ? { Authorization: `Bearer ${session.token}` } : {}) }, body: JSON.stringify({ message: prompt, history: (messages.ai || []).slice(-8) }) }); const data = await response.json(); if (!response.ok) throw new Error(data.error); setMessages((old) => ({ ...old, ai: [...old.ai.filter((item) => !item.pending), { from: 'ai', text: data.reply, time: 'Now' }] })); } catch (error) { setMessages((old) => ({ ...old, ai: [...old.ai.filter((item) => !item.pending), { from: 'ai', text: error.message || 'Connect an AI provider in the server settings to get started.', time: 'Now' }] })); } };
-  const sendVoice = async (blob) => { let url = URL.createObjectURL(blob); if (session?.token) { try { const data = new FormData(); data.append('file', blob, `voice-${Date.now()}.webm`); const response = await fetch('/api/media', { method: 'POST', headers: { Authorization: `Bearer ${session.token}` }, body: data }); if (response.ok) url = (await response.json()).url; } catch { toast('Voice note saved for this session only.'); } } const item = { from: 'me', audio: url, time: new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) }; setMessages((old) => ({ ...old, [selected]: [...(old[selected] || []), item] })); if (socket && !session?.demo) socket.emit('direct:message', { to: selected, audio: url }); };
+  const askAI = async (prompt) => { const thinking = { from: 'ai', text: 'One moment…', time: '', pending: true }; setMessages((old) => ({ ...old, ai: [...(old.ai || []), thinking] })); try { if (session?.demo) throw new Error('AI chat is ready for verified accounts once an AI provider is configured on the server.'); const response = await fetch('/api/ai/chat', { method: 'POST', headers: { 'Content-Type': 'application/json', ...(session?.token ? { Authorization: `Bearer ${session.token}` } : {}) }, body: JSON.stringify({ message: prompt, history: (messages.ai || []).slice(-8) }) }); const data = await readApiJson(response); setMessages((old) => ({ ...old, ai: [...old.ai.filter((item) => !item.pending), { from: 'ai', text: data.reply, time: 'Now' }] })); } catch (error) { setMessages((old) => ({ ...old, ai: [...old.ai.filter((item) => !item.pending), { from: 'ai', text: error.message || 'Connect an AI provider in the server settings to get started.', time: 'Now' }] })); } };
+  const sendVoice = async (blob) => { let url = URL.createObjectURL(blob); if (session?.token) { try { const data = new FormData(); data.append('file', blob, `voice-${Date.now()}.webm`); const response = await fetch('/api/media', { method: 'POST', headers: { Authorization: `Bearer ${session.token}` }, body: data }); url = (await readApiJson(response)).url; } catch { toast('Voice note saved for this session only.'); } } const item = { from: 'me', audio: url, time: new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) }; setMessages((old) => ({ ...old, [selected]: [...(old[selected] || []), item] })); if (socket && !session?.demo) socket.emit('direct:message', { to: selected, audio: url }); };
   const toggleRecord = async () => { if (recording) { recorderRef.current?.stop(); setRecording(false); return; } try { const stream = await navigator.mediaDevices.getUserMedia({ audio: true }); const recorder = new MediaRecorder(stream); chunksRef.current = []; recorder.ondataavailable = (event) => chunksRef.current.push(event.data); recorder.onstop = () => { sendVoice(new Blob(chunksRef.current, { type: recorder.mimeType || 'audio/webm' })); stream.getTracks().forEach((track) => track.stop()); }; recorder.start(); recorderRef.current = recorder; setRecording(true); } catch { toast('Allow microphone access to record a voice note.'); } };
   const person = selected === 'ai' ? { id: 'ai', name: 'Nexo AI', avatar: 'https://images.unsplash.com/photo-1524504388940-b1c1722653e1?w=120&h=120&fit=crop&crop=faces', online: true, note: 'always here to help' } : people.find((item) => item.id === selected) || people[0];
   const list = [{ id: 'ai', name: 'Nexo AI', avatar: 'https://images.unsplash.com/photo-1524504388940-b1c1722653e1?w=120&h=120&fit=crop&crop=faces', online: true }, ...people].filter((item) => item.name.toLowerCase().includes(search.toLowerCase()));
@@ -191,7 +200,7 @@ function CallModal({ person, incoming = false, onClose, socket, session, toast }
       streamRef.current = stream; if (videoRef.current) videoRef.current.srcObject = stream;
       if (socket?.connected && !session?.demo && person.id !== 'ai') {
         let iceServers = [{ urls: 'stun:stun.l.google.com:19302' }];
-        try { const response = await fetch('/api/calls/ice-servers', { headers: { Authorization: `Bearer ${session.token}` } }); if (response.ok) iceServers = (await response.json()).iceServers || iceServers; } catch {}
+        try { const response = await fetch('/api/calls/ice-servers', { headers: { Authorization: `Bearer ${session.token}` } }); iceServers = (await readApiJson(response)).iceServers || iceServers; } catch {}
         if (!active) { stream.getTracks().forEach((track) => track.stop()); return; }
         const peer = new RTCPeerConnection({ iceServers }); peerRef.current = peer;
         stream.getTracks().forEach((track) => peer.addTrack(track, stream));
@@ -258,7 +267,7 @@ function AppWorkspace({ session, onSignOut }) {
       try {
         const [meResponse, peopleResponse, postsResponse, messagesResponse, statusesResponse] = await Promise.all(['/api/me', '/api/users', '/api/posts', '/api/messages', '/api/statuses'].map((url) => fetch(url, { headers })));
         if ([meResponse, peopleResponse, postsResponse, messagesResponse, statusesResponse].some((response) => response.status === 401)) { if (active) onSignOut(); return; }
-        const [meData, peopleData, postData, messageData, statusData] = await Promise.all([meResponse.json(), peopleResponse.json(), postsResponse.json(), messagesResponse.json(), statusesResponse.json()]);
+        const [meData, peopleData, postData, messageData, statusData] = await Promise.all([meResponse, peopleResponse, postsResponse, messagesResponse, statusesResponse].map(readApiJson));
         if (!active) return;
         setProfile(meData.user);
         const nextPeople = peopleData.filter((person) => person.id !== user.id).map((person, index) => ({ ...person, avatar: person.avatar || initialPeople[index % initialPeople.length].avatar, online: Boolean(person.online), note: person.online ? 'around right now' : 'last seen recently' }));
@@ -273,7 +282,7 @@ function AppWorkspace({ session, onSignOut }) {
         });
         setMessages(grouped);
         setStatuses(statusData.map((item) => ({ ...item, seen: false, own: item.userId === user.id })));
-      } catch { if (active) toast('Could not refresh shared content. Check your connection.'); }
+      } catch (error) { if (active) toast(error.message || 'Could not refresh shared content. Check your connection.'); }
     };
     load();
     const client = io({ auth: { token: session.token } }); setSocket(client);
@@ -289,7 +298,7 @@ function AppWorkspace({ session, onSignOut }) {
   const makePost = async (body, image) => {
     const optimistic = { id: `p-${Date.now()}`, author: { ...profile, handle: profile.handle || 'you' }, time: 'just now', body, image, likes: 0, comments: [], liked: false, reposted: false };
     if (session?.token) {
-      try { const uploadedImage = await uploadImage(image, session.token); const response = await fetch('/api/posts', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${session.token}` }, body: JSON.stringify({ body, image: uploadedImage }) }); const post = await response.json(); if (!response.ok) throw new Error(post.error); setPosts((old) => [{ ...post, author: { ...post.author, avatar: post.author.avatar || profile.avatar } }, ...old]); toast('Your post is out in the world.'); }
+      try { const uploadedImage = await uploadImage(image, session.token); const response = await fetch('/api/posts', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${session.token}` }, body: JSON.stringify({ body, image: uploadedImage }) }); const post = await readApiJson(response); setPosts((old) => [{ ...post, author: { ...post.author, avatar: post.author.avatar || profile.avatar } }, ...old]); toast('Your post is out in the world.'); }
       catch (error) { toast(error.message || 'Your post could not be shared.'); }
     } else { setPosts((old) => [optimistic, ...old]); toast('Your post is out in the world.'); }
   };
@@ -300,7 +309,7 @@ function AppWorkspace({ session, onSignOut }) {
   const actionSave = (id) => { setSaved((old) => old.includes(id) ? old.filter((item) => item !== id) : [...old, id]); if (session?.token) fetch(`/api/posts/${id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${session.token}` }, body: JSON.stringify({ action: 'save' }) }).catch(() => toast('Bookmark could not be synced.')); };
   const publishStatus = async (item) => {
     if (session?.token) {
-      try { const image = await uploadImage(item.image, session.token); const response = await fetch('/api/statuses', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${session.token}` }, body: JSON.stringify({ caption: item.caption, image }) }); const result = await response.json(); if (!response.ok) throw new Error(result.error); }
+      try { const image = await uploadImage(item.image, session.token); const response = await fetch('/api/statuses', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${session.token}` }, body: JSON.stringify({ caption: item.caption, image }) }); await readApiJson(response); }
       catch (error) { toast(error.message || 'Status could not be shared.'); return; }
     }
     setStatuses((old) => [{ ...item, own: true }, ...old]); setShowStatus(false); toast('Your status is live for 24 hours.');
@@ -332,7 +341,7 @@ function AppWorkspace({ session, onSignOut }) {
     <nav className="mobile-bottom">{nav.slice(0, 4).map(({ id, label, icon: Icon }) => <button key={id} className={view === id ? 'active' : ''} onClick={() => setView(id)}><Icon size={20} /><span>{label}</span></button>)}</nav>
     {story && <StoryViewer story={story} onClose={() => setStory(null)} onDownload={downloadStatus} />}
     {showStatus && <StatusComposer user={profile} onClose={() => setShowStatus(false)} onPublish={publishStatus} />}
-    {showProfile && <ProfileModal user={profile} onClose={() => setShowProfile(false)} onSave={async (next) => { try { let saved = next; if (session?.token) { const avatar = await uploadImage(next.avatar, session.token); const cover = await uploadImage(next.cover, session.token); const response = await fetch('/api/me', { method: 'PATCH', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${session.token}` }, body: JSON.stringify({ name: next.name, bio: next.bio, avatar, cover }) }); const data = await response.json(); if (!response.ok) throw new Error(data.error); saved = { ...data.user, avatar: data.user.avatar || next.avatar, cover: data.user.cover || next.cover }; } setProfile(saved); setShowProfile(false); toast('Your profile has been updated.'); } catch (error) { toast(error.message || 'Profile could not be updated.'); } }} />}
+    {showProfile && <ProfileModal user={profile} onClose={() => setShowProfile(false)} onSave={async (next) => { try { let saved = next; if (session?.token) { const avatar = await uploadImage(next.avatar, session.token); const cover = await uploadImage(next.cover, session.token); const response = await fetch('/api/me', { method: 'PATCH', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${session.token}` }, body: JSON.stringify({ name: next.name, bio: next.bio, avatar, cover }) }); const data = await readApiJson(response); saved = { ...data.user, avatar: data.user.avatar || next.avatar, cover: data.user.cover || next.cover }; } setProfile(saved); setShowProfile(false); toast('Your profile has been updated.'); } catch (error) { toast(error.message || 'Profile could not be updated.'); } }} />}
     {incomingCall && !callPerson && <IncomingCall person={incomingCall} onAccept={() => { setCallPerson({ ...incomingCall, incoming: true }); setIncomingCall(null); }} onDecline={() => { socket?.emit('call:reject', { to: incomingCall.id }); setIncomingCall(null); }} />}
     {callPerson && <CallModal person={callPerson} incoming={callPerson.incoming} onClose={() => setCallPerson(null)} socket={socket} session={session} toast={toast} />}
     {toastText && <div className="toast"><Check size={16} />{toastText}</div>}
